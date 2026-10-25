@@ -14,6 +14,7 @@ import {
   Trash2,
   Users,
 } from "lucide-react";
+import { ensureAnonymousUser } from "../../lib/auth";
 
 type Invitee = {
   id: number;
@@ -155,6 +156,30 @@ export default function CreateGroupPage() {
     setError("");
     setCreating(true);
 
+    let user;
+
+try {
+  user = await ensureAnonymousUser();
+} catch (authError) {
+  console.error("Anonymous auth failed:", authError);
+
+  setError(
+    "I couldn't create your private identity. Please try again."
+  );
+
+  setCreating(false);
+  return;
+}
+
+if (!user) {
+  setError(
+    "I couldn't create your private identity. Please try again."
+  );
+
+  setCreating(false);
+  return;
+}
+
     const code = makeRoomCode();
 
     const invitedMembers: RoomMember[] = invitees
@@ -194,6 +219,7 @@ if (roomError || !createdRoom) {
 const members = [
   {
     room_id: createdRoom.id,
+    user_id: user.id,
     display_name: creatorName.trim(),
     phone: null,
     role: "creator",

@@ -2,6 +2,7 @@
 
 import Link from "next/link";
 import { useSearchParams } from "next/navigation";
+
 import {
   ArrowLeft,
   Check,
@@ -14,9 +15,11 @@ import {
   Sparkles,
   Users,
 } from "lucide-react";
+
 import {
   FormEvent,
   Suspense,
+  useCallback,
   useEffect,
   useMemo,
   useRef,
@@ -24,6 +27,28 @@ import {
 } from "react";
 
 import { supabase } from "../../lib/supabase";
+import { ensureAnonymousUser } from "../../lib/auth";
+
+import {
+  CoordinationRequest,
+  createCoordinationRequest,
+  formatAgentProgress,
+  formatSlotForChat,
+  getCoordinationResult,
+  markRequestProposed,
+} from "../../lib/coordination/coordinator";
+
+import {
+  evaluateRequestForCurrentUser,
+} from "../../lib/coordination/personalAgent";
+
+import {
+  createPrivateConfirmations,
+  getConfirmationSummary,
+  getMyPendingConfirmation,
+  PrivateConfirmation,
+  respondToConfirmation,
+} from "../../lib/coordination/confirmations";
 
 /* ============================================================
    TYPES
@@ -35,6 +60,7 @@ type RoomMember = {
   phone: string;
   role: "creator" | "member";
   status: "joined" | "invited";
+  userId: string | null;
 };
 
 type StoredRoom = {
@@ -45,7 +71,10 @@ type StoredRoom = {
   members: RoomMember[];
 };
 
-type MessageKind = "human" | "cubbie" | "system";
+type MessageKind =
+  | "human"
+  | "cubbie"
+  | "system";
 
 type Message = {
   id: string;
@@ -56,23 +85,43 @@ type Message = {
   time: string;
 };
 
+type ProposedPlan = {
+  requestId: string;
+  start: string;
+  end: string;
+};
+
 /* ============================================================
    HELPERS
    ============================================================ */
 
-function formatTime(value: string | Date) {
-  return new Intl.DateTimeFormat("en-US", {
-    hour: "numeric",
-    minute: "2-digit",
-  }).format(
+function formatTime(
+  value: string | Date
+) {
+  return new Intl.DateTimeFormat(
+    "en-US",
+    {
+      hour: "numeric",
+      minute: "2-digit",
+    }
+  ).format(
     typeof value === "string"
       ? new Date(value)
       : value
   );
 }
 
-function makeMessageId() {
-  return crypto.randomUUID();
+function sleep(
+  milliseconds: number
+) {
+  return new Promise<void>(
+    (resolve) => {
+      window.setTimeout(
+        resolve,
+        milliseconds
+      );
+    }
+  );
 }
 
 /* ============================================================
@@ -81,99 +130,235 @@ function makeMessageId() {
 
 export default function RoomPage() {
   return (
-    <Suspense fallback={<RoomLoading />}>
+    <Suspense
+      fallback={<RoomLoading />}
+    >
       <RoomExperience />
     </Suspense>
   );
 }
 
 /* ============================================================
-   ROOM EXPERIENCE
+   ROOM
    ============================================================ */
 
 function RoomExperience() {
-  const searchParams = useSearchParams();
+  const searchParams =
+    useSearchParams();
 
   const code =
-    searchParams.get("code")?.toUpperCase() ?? "";
+    searchParams
+      .get("code")
+      ?.trim()
+      .toUpperCase() ?? "";
 
   const [room, setRoom] =
-    useState<StoredRoom | null>(null);
+    useState<StoredRoom | null>(
+      null
+    );
 
-  const [currentUser, setCurrentUser] =
-    useState("");
+  const [
+    currentUser,
+    setCurrentUser,
+  ] = useState("");
 
-  const [messages, setMessages] =
-    useState<Message[]>([]);
+  const [
+    currentUserId,
+    setCurrentUserId,
+  ] = useState("");
 
-  const [composer, setComposer] =
-    useState("");
+  const [
+    currentMemberId,
+    setCurrentMemberId,
+  ] = useState("");
 
-  const [loading, setLoading] =
-    useState(true);
+  const [
+    messages,
+    setMessages,
+  ] = useState<Message[]>([]);
 
-  const [sending, setSending] =
-    useState(false);
+  const [
+    composer,
+    setComposer,
+  ] = useState("");
 
-  const [cubbieTyping, setCubbieTyping] =
-    useState(false);
+  const [
+    loading,
+    setLoading,
+  ] = useState(true);
 
-  const [copied, setCopied] =
-    useState(false);
+  const [
+    sending,
+    setSending,
+  ] = useState(false);
+
+  const [
+    cubbieTyping,
+    setCubbieTyping,
+  ] = useState(false);
+
+  const [
+    copied,
+    setCopied,
+  ] = useState(false);
+
+  const [
+    activeRequest,
+    setActiveRequest,
+  ] =
+    useState<CoordinationRequest | null>(
+      null
+    );
+
+  const [
+    proposedPlan,
+    setProposedPlan,
+  ] =
+    useState<ProposedPlan | null>(
+      null
+    );
+
+  const [
+    coordinationProgress,
+    setCoordinationProgress,
+  ] = useState("");
+
+  const [
+    coordinationBusy,
+    setCoordinationBusy,
+  ] = useState(false);
+
+  const [
+    confirmationStarted,
+    setConfirmationStarted,
+  ] = useState(false);
+
+  const [
+    myConfirmation,
+    setMyConfirmation,
+  ] =
+    useState<PrivateConfirmation | null>(
+      null
+    );
+
+  const [
+    confirmationProgress,
+    setConfirmationProgress,
+  ] = useState("");
+
+  const [
+    confirmationBusy,
+    setConfirmationBusy,
+  ] = useState(false);
+
+  const processedRequests =
+    useRef<Set<string>>(
+      new Set()
+    );
+
+  const finalizedRequests =
+    useRef<Set<string>>(
+      new Set()
+    );
+
+  const finalizedConfirmations =
+    useRef<Set<string>>(
+      new Set()
+    );
 
   const bottomRef =
-    useRef<HTMLDivElement | null>(null);
+    useRef<HTMLDivElement | null>(
+      null
+    );
 
   /* ==========================================================
-     LOAD ROOM FROM SUPABASE
+     INSERT MESSAGE
      ========================================================== */
 
-  useEffect(() => {
-  if (!room) {
-    return;
-  }
+  const insertMessage =
+    useCallback(
+      async ({
+        roomId,
+        sender,
+        body,
+        kind,
+      }: {
+        roomId: string;
+        sender: string;
+        body: string;
+        kind: MessageKind;
+      }) => {
+        const {
+          data,
+          error,
+        } = await supabase
+          .from("messages")
+          .insert({
+            room_id: roomId,
+            sender_name: sender,
+            sender_type: kind,
+            body,
+          })
+          .select("*")
+          .single();
 
-  const channel = supabase
-    .channel(`room-messages-${room.id}`)
-    .on(
-      "postgres_changes",
-      {
-        event: "INSERT",
-        schema: "public",
-        table: "messages",
-        filter: `room_id=eq.${room.id}`,
-      },
-      (payload) => {
-        const row = payload.new;
+        if (
+          error ||
+          !data
+        ) {
+          console.error(
+            "Message insert failed:",
+            error
+          );
 
-        const incoming: Message = {
-          id: row.id,
-          sender: row.sender_name,
-          body: row.body,
-          kind: row.sender_type as MessageKind,
-          mine: row.sender_name === currentUser,
-          time: formatTime(row.created_at),
+          return null;
+        }
+
+        const message:
+          Message = {
+          id: data.id,
+          sender:
+            data.sender_name,
+          body:
+            data.body,
+          kind:
+            data.sender_type as MessageKind,
+          mine:
+            data.sender_name ===
+            currentUser,
+          time:
+            formatTime(
+              data.created_at
+            ),
         };
 
-        setMessages((current) => {
-          if (
-            current.some(
-              (message) => message.id === incoming.id
-            )
-          ) {
-            return current;
+        setMessages(
+          (current) => {
+            if (
+              current.some(
+                (item) =>
+                  item.id ===
+                  message.id
+              )
+            ) {
+              return current;
+            }
+
+            return [
+              ...current,
+              message,
+            ];
           }
+        );
 
-          return [...current, incoming];
-        });
-      }
-    )
-    .subscribe();
+        return message;
+      },
+      [currentUser]
+    );
 
-  return () => {
-    supabase.removeChannel(channel);
-  };
-}, [room, currentUser]);
+  /* ==========================================================
+     LOAD ROOM
+     ========================================================== */
 
   useEffect(() => {
     if (!code) {
@@ -181,203 +366,189 @@ function RoomExperience() {
       return;
     }
 
-    async function loadRoom() {
+    async function load() {
       setLoading(true);
 
-      /* ------------------------
-         1. Find room
-         ------------------------ */
+      try {
+        const authUser =
+          await ensureAnonymousUser();
 
-      const {
-        data: roomData,
-        error: roomError,
-      } = await supabase
-        .from("rooms")
-        .select("*")
-        .eq("code", code)
-        .single();
+        if (!authUser) {
+          throw new Error(
+            "Missing identity"
+          );
+        }
 
-      if (roomError || !roomData) {
-        console.error(
-          "Room lookup failed:",
-          roomError
+        setCurrentUserId(
+          authUser.id
         );
-
-        setRoom(null);
-        setLoading(false);
-
-        return;
-      }
-
-      /* ------------------------
-         2. Load members
-         ------------------------ */
-
-      const {
-        data: memberData,
-        error: memberError,
-      } = await supabase
-        .from("room_members")
-        .select("*")
-        .eq("room_id", roomData.id)
-        .order("created_at", {
-          ascending: true,
-        });
-
-      if (memberError) {
-        console.error(
-          "Member lookup failed:",
-          memberError
-        );
-
-        setRoom(null);
-        setLoading(false);
-
-        return;
-      }
-
-      const loadedRoom: StoredRoom = {
-        id: roomData.id,
-        code: roomData.code,
-        name: roomData.name,
-        createdAt: roomData.created_at,
-
-        members: (memberData ?? []).map(
-          (member) => ({
-            id: member.id,
-            name: member.display_name,
-            phone: member.phone ?? "",
-            role: member.role,
-            status: member.status,
-          })
-        ),
-      };
-
-      setRoom(loadedRoom);
-
-      /* ------------------------
-         3. Current browser user
-         ------------------------ */
-
-      const storedUser =
-        localStorage.getItem(
-          `balance-current-user-${code}`
-        );
-
-      const fallbackCreator =
-        loadedRoom.members.find(
-          (member) =>
-            member.role === "creator"
-        )?.name;
-
-      setCurrentUser(
-        storedUser ||
-          fallbackCreator ||
-          "You"
-      );
-
-      /* ------------------------
-         4. Load messages
-         ------------------------ */
-
-      const {
-        data: messageData,
-        error: messageError,
-      } = await supabase
-        .from("messages")
-        .select("*")
-        .eq("room_id", roomData.id)
-        .order("created_at", {
-          ascending: true,
-        });
-
-      if (messageError) {
-        console.error(
-          "Message lookup failed:",
-          messageError
-        );
-      }
-
-      if (
-        messageData &&
-        messageData.length > 0
-      ) {
-        setMessages(
-          messageData.map(
-            (message) => ({
-              id: message.id,
-
-              sender:
-                message.sender_name,
-
-              body:
-                message.body,
-
-              kind:
-                message.sender_type as MessageKind,
-
-              mine:
-                message.sender_name ===
-                storedUser,
-
-              time:
-                formatTime(
-                  message.created_at
-                ),
-            })
-          )
-        );
-      } else {
-        /*
-         * First opening of this room.
-         * Create shared welcome messages.
-         */
-
-        const welcomeMessages = [
-          {
-            room_id: roomData.id,
-
-            sender_name: "Cubbie",
-
-            sender_type: "cubbie",
-
-            body:
-              `group's ready 🎉 ` +
-              `code: ${code}`,
-          },
-
-          {
-            room_id: roomData.id,
-
-            sender_name: "Cubbie",
-
-            sender_type: "cubbie",
-
-            body:
-              "need help planning? " +
-              "just @ me. i'll check " +
-              "with everyone privately.",
-          },
-        ];
 
         const {
-          data: insertedMessages,
-          error: welcomeError,
+          data: roomData,
+          error: roomError,
+        } = await supabase
+          .from("rooms")
+          .select("*")
+          .eq(
+            "code",
+            code
+          )
+          .single();
+
+        if (
+          roomError ||
+          !roomData
+        ) {
+          setRoom(null);
+          setLoading(false);
+          return;
+        }
+
+        const {
+          data: memberData,
+          error: memberError,
+        } = await supabase
+          .from(
+            "room_members"
+          )
+          .select(`
+            id,
+            display_name,
+            phone,
+            role,
+            status,
+            user_id,
+            created_at
+          `)
+          .eq(
+            "room_id",
+            roomData.id
+          )
+          .order(
+            "created_at",
+            {
+              ascending: true,
+            }
+          );
+
+        if (memberError) {
+          throw memberError;
+        }
+
+        const members:
+          RoomMember[] =
+          (
+            memberData ?? []
+          ).map(
+            (member) => ({
+              id:
+                member.id,
+
+              name:
+                member.display_name,
+
+              phone:
+                member.phone ?? "",
+
+              role:
+                member.role,
+
+              status:
+                member.status,
+
+              userId:
+                member.user_id ??
+                null,
+            })
+          );
+
+        const loadedRoom:
+          StoredRoom = {
+          id:
+            roomData.id,
+
+          code:
+            roomData.code,
+
+          name:
+            roomData.name,
+
+          createdAt:
+            roomData.created_at,
+
+          members,
+        };
+
+        setRoom(
+          loadedRoom
+        );
+
+        const ownMember =
+          members.find(
+            (member) =>
+              member.userId ===
+              authUser.id
+          );
+
+        const storedName =
+          localStorage.getItem(
+            `balance-current-user-${code}`
+          );
+
+        const name =
+          ownMember?.name ??
+          storedName ??
+          "You";
+
+        setCurrentUser(
+          name
+        );
+
+        if (ownMember) {
+          setCurrentMemberId(
+            ownMember.id
+          );
+
+          localStorage.setItem(
+            `balance-current-user-${code}`,
+            ownMember.name
+          );
+        }
+
+        /* ------------------------
+           Messages
+           ------------------------ */
+
+        const {
+          data: messageData,
+          error: messageError,
         } = await supabase
           .from("messages")
-          .insert(welcomeMessages)
-          .select();
-
-        if (welcomeError) {
-          console.error(
-            "Welcome messages failed:",
-            welcomeError
+          .select("*")
+          .eq(
+            "room_id",
+            roomData.id
+          )
+          .order(
+            "created_at",
+            {
+              ascending: true,
+            }
           );
-        } else if (insertedMessages) {
+
+        if (messageError) {
+          throw messageError;
+        }
+
+        if (
+          messageData &&
+          messageData.length > 0
+        ) {
           setMessages(
-            insertedMessages.map(
+            messageData.map(
               (message) => ({
-                id: message.id,
+                id:
+                  message.id,
 
                 sender:
                   message.sender_name,
@@ -388,7 +559,9 @@ function RoomExperience() {
                 kind:
                   message.sender_type as MessageKind,
 
-                mine: false,
+                mine:
+                  message.sender_name ===
+                  name,
 
                 time:
                   formatTime(
@@ -397,46 +570,832 @@ function RoomExperience() {
               })
             )
           );
-        }
-      }
+        } else {
+          await supabase
+            .from("messages")
+            .insert([
+              {
+                room_id:
+                  roomData.id,
 
-      setLoading(false);
+                sender_name:
+                  "Cubbie",
+
+                sender_type:
+                  "cubbie",
+
+                body:
+                  `group's ready 🎉 code: ${code}`,
+              },
+              {
+                room_id:
+                  roomData.id,
+
+                sender_name:
+                  "Cubbie",
+
+                sender_type:
+                  "cubbie",
+
+                body:
+                  "need help planning? just @ me. i'll check with everyone privately.",
+              },
+            ]);
+        }
+
+        /* ------------------------
+           Latest request
+           ------------------------ */
+
+        const {
+          data: requestData,
+        } = await supabase
+          .from(
+            "coordination_requests"
+          )
+          .select("*")
+          .eq(
+            "room_id",
+            roomData.id
+          )
+          .in(
+            "status",
+            [
+              "collecting",
+              "ready",
+              "proposed",
+            ]
+          )
+          .order(
+            "created_at",
+            {
+              ascending: false,
+            }
+          )
+          .limit(1)
+          .maybeSingle();
+
+        if (requestData) {
+          const request =
+            requestData as
+              CoordinationRequest;
+
+          if (
+            request.status ===
+            "collecting" ||
+            request.status ===
+            "ready"
+          ) {
+            setActiveRequest(
+              request
+            );
+          }
+
+          if (
+            request.status ===
+              "proposed" &&
+            request.selected_start &&
+            request.selected_end
+          ) {
+            setProposedPlan({
+              requestId:
+                request.id,
+
+              start:
+                request.selected_start,
+
+              end:
+                request.selected_end,
+            });
+
+            /*
+             * See whether THIS user has
+             * a pending confirmation.
+             */
+            try {
+              const pending =
+                await getMyPendingConfirmation({
+                  requestId:
+                    request.id,
+                });
+
+              if (pending) {
+                setMyConfirmation(
+                  pending
+                );
+
+                setConfirmationStarted(
+                  true
+                );
+              }
+            } catch {
+              /*
+               * Confirmation may not
+               * have been created yet.
+               */
+            }
+          }
+        }
+
+        setLoading(false);
+      } catch (error) {
+        console.error(
+          "Room loading failed:",
+          error
+        );
+
+        setRoom(null);
+        setLoading(false);
+      }
     }
 
-    loadRoom();
+    load();
   }, [code]);
 
   /* ==========================================================
-     SCROLL TO NEWEST MESSAGE
+     REALTIME MESSAGES
+     ========================================================== */
+
+  useEffect(() => {
+    if (!room) {
+      return;
+    }
+
+    const channel =
+      supabase
+        .channel(
+          `messages-${room.id}`
+        )
+        .on(
+          "postgres_changes",
+          {
+            event:
+              "INSERT",
+
+            schema:
+              "public",
+
+            table:
+              "messages",
+
+            filter:
+              `room_id=eq.${room.id}`,
+          },
+          (payload) => {
+            const row =
+              payload.new;
+
+            const incoming:
+              Message = {
+              id:
+                row.id,
+
+              sender:
+                row.sender_name,
+
+              body:
+                row.body,
+
+              kind:
+                row.sender_type as MessageKind,
+
+              mine:
+                row.sender_name ===
+                currentUser,
+
+              time:
+                formatTime(
+                  row.created_at
+                ),
+            };
+
+            setMessages(
+              (current) => {
+                if (
+                  current.some(
+                    (message) =>
+                      message.id ===
+                      incoming.id
+                  )
+                ) {
+                  return current;
+                }
+
+                return [
+                  ...current,
+                  incoming,
+                ];
+              }
+            );
+          }
+        )
+        .subscribe();
+
+    return () => {
+      supabase.removeChannel(
+        channel
+      );
+    };
+  }, [
+    room,
+    currentUser,
+  ]);
+
+  /* ==========================================================
+     REALTIME COORDINATION REQUESTS
+     ========================================================== */
+
+  useEffect(() => {
+    if (!room) {
+      return;
+    }
+
+    const channel =
+      supabase
+        .channel(
+          `requests-${room.id}`
+        )
+        .on(
+          "postgres_changes",
+          {
+            event:
+              "*",
+
+            schema:
+              "public",
+
+            table:
+              "coordination_requests",
+
+            filter:
+              `room_id=eq.${room.id}`,
+          },
+          (payload) => {
+            const request =
+              payload.new as
+                CoordinationRequest;
+
+            if (!request?.id) {
+              return;
+            }
+
+            if (
+              request.status ===
+                "collecting" ||
+              request.status ===
+                "ready"
+            ) {
+              setActiveRequest(
+                request
+              );
+            }
+
+            if (
+              request.status ===
+                "proposed" &&
+              request.selected_start &&
+              request.selected_end
+            ) {
+              setActiveRequest(
+                null
+              );
+
+              setProposedPlan({
+                requestId:
+                  request.id,
+
+                start:
+                  request.selected_start,
+
+                end:
+                  request.selected_end,
+              });
+            }
+
+            if (
+              request.status ===
+                "confirmed" ||
+              request.status ===
+                "cancelled"
+            ) {
+              setActiveRequest(
+                null
+              );
+            }
+          }
+        )
+        .subscribe();
+
+    return () => {
+      supabase.removeChannel(
+        channel
+      );
+    };
+  }, [room]);
+
+  /* ==========================================================
+     PERSONAL AGENT EVALUATION
+     ========================================================== */
+
+  useEffect(() => {
+    if (
+      !room ||
+      !activeRequest ||
+      !currentUserId ||
+      !currentMemberId
+    ) {
+      return;
+    }
+
+    if (
+      activeRequest.status !==
+      "collecting"
+    ) {
+      return;
+    }
+
+    if (
+      processedRequests.current.has(
+        activeRequest.id
+      )
+    ) {
+      return;
+    }
+
+    processedRequests.current.add(
+      activeRequest.id
+    );
+
+    async function evaluate() {
+      try {
+        setCoordinationProgress(
+          "your Cubbie is checking privately..."
+        );
+
+        await evaluateRequestForCurrentUser({
+          requestId:
+            activeRequest!.id,
+
+          roomId:
+            room!.id,
+
+          durationMinutes:
+            activeRequest!
+              .duration_minutes,
+        });
+
+        setCoordinationProgress(
+          "your Cubbie checked in ✓"
+        );
+      } catch (error) {
+        console.error(
+          error
+        );
+
+        processedRequests.current.delete(
+          activeRequest!.id
+        );
+
+        setCoordinationProgress(
+          "your Cubbie couldn't evaluate this request — check your private setup."
+        );
+      }
+    }
+
+    evaluate();
+  }, [
+    room,
+    activeRequest,
+    currentUserId,
+    currentMemberId,
+  ]);
+
+  /* ==========================================================
+     PROPOSALS → WINNER
+     ========================================================== */
+
+  useEffect(() => {
+    if (
+      !room ||
+      !activeRequest
+    ) {
+      return;
+    }
+
+    async function check() {
+      try {
+        const result =
+          await getCoordinationResult(
+            activeRequest!.id,
+            room!.id
+          );
+
+        setCoordinationProgress(
+          formatAgentProgress({
+            respondingMembers:
+              result.respondingMembers,
+
+            joinedMembers:
+              result.joinedMembers,
+          })
+        );
+
+        if (!result.ready) {
+          return;
+        }
+
+        /*
+         * Only the requester posts
+         * the final recommendation.
+         */
+        if (
+          activeRequest!
+            .requested_by !==
+          currentUserId
+        ) {
+          return;
+        }
+
+        if (
+          finalizedRequests.current.has(
+            activeRequest!.id
+          )
+        ) {
+          return;
+        }
+
+        finalizedRequests.current.add(
+          activeRequest!.id
+        );
+
+        if (!result.winner) {
+          await insertMessage({
+            roomId:
+              room!.id,
+
+            sender:
+              "Cubbie",
+
+            kind:
+              "cubbie",
+
+            body:
+              result.explanation ??
+              "i couldn't find a time that keeps everyone feasible.",
+          });
+
+          await supabase
+            .from(
+              "coordination_requests"
+            )
+            .update({
+              status:
+                "cancelled",
+            })
+            .eq(
+              "id",
+              activeRequest!.id
+            );
+
+          return;
+        }
+
+        await markRequestProposed({
+          requestId:
+            activeRequest!.id,
+
+          winner:
+            result.winner,
+        });
+
+        setProposedPlan({
+          requestId:
+            activeRequest!.id,
+
+          start:
+            result.winner.start,
+
+          end:
+            result.winner.end,
+        });
+
+        const slot =
+          formatSlotForChat(
+            result.winner.start,
+            result.winner.end
+          );
+
+        await insertMessage({
+          roomId:
+            room!.id,
+
+          sender:
+            "Cubbie",
+
+          kind:
+            "cubbie",
+
+          body:
+            `${slot} looks best ✨\n\n${result.explanation ?? "This is the strongest overall fit."}\n\nI used only coordination signals — not anyone's private reason.`,
+        });
+
+        setCoordinationProgress(
+          ""
+        );
+      } catch (error) {
+        console.error(
+          "Coordination failed:",
+          error
+        );
+      }
+    }
+
+    check();
+
+    const channel =
+      supabase
+        .channel(
+          `proposals-${activeRequest.id}`
+        )
+        .on(
+          "postgres_changes",
+          {
+            event:
+              "INSERT",
+
+            schema:
+              "public",
+
+            table:
+              "agent_proposals",
+
+            filter:
+              `request_id=eq.${activeRequest.id}`,
+          },
+          () => {
+            check();
+          }
+        )
+        .subscribe();
+
+    return () => {
+      supabase.removeChannel(
+        channel
+      );
+    };
+  }, [
+    room,
+    activeRequest,
+    currentUserId,
+    insertMessage,
+  ]);
+
+  /* ==========================================================
+     REALTIME CONFIRMATIONS
+     ========================================================== */
+
+  useEffect(() => {
+    if (
+      !room ||
+      !proposedPlan
+    ) {
+      return;
+    }
+
+    async function refreshOwnConfirmation() {
+      try {
+        const pending =
+          await getMyPendingConfirmation({
+            requestId:
+              proposedPlan!.requestId,
+          });
+
+        setMyConfirmation(
+          pending
+        );
+
+        if (pending) {
+          setConfirmationStarted(
+            true
+          );
+        }
+      } catch {
+        /*
+         * No visible confirmation yet.
+         */
+      }
+    }
+
+    async function refreshSummary() {
+      try {
+        const summary =
+          await getConfirmationSummary({
+            requestId:
+              proposedPlan!.requestId,
+
+            roomId:
+              room!.id,
+          });
+
+        if (
+          summary.total === 0
+        ) {
+          return;
+        }
+
+        setConfirmationStarted(
+          true
+        );
+
+        if (
+          summary.declined > 0
+        ) {
+          setConfirmationProgress(
+            "the current plan needs another option"
+          );
+        } else if (
+          summary.pending > 0
+        ) {
+          setConfirmationProgress(
+            `${summary.confirmed}/${summary.total} confirmed`
+          );
+        } else if (
+          summary.confirmed ===
+          summary.total
+        ) {
+          setConfirmationProgress(
+            "everyone confirmed ✓"
+          );
+
+          /*
+           * Only the original requester
+           * posts the final group result.
+           */
+
+          const {
+            data: request,
+          } = await supabase
+            .from(
+              "coordination_requests"
+            )
+            .select(
+              "requested_by"
+            )
+            .eq(
+              "id",
+              proposedPlan!
+                .requestId
+            )
+            .single();
+
+          if (
+            request?.requested_by ===
+              currentUserId &&
+            !finalizedConfirmations
+              .current
+              .has(
+                proposedPlan!
+                  .requestId
+              )
+          ) {
+            finalizedConfirmations
+              .current
+              .add(
+                proposedPlan!
+                  .requestId
+              );
+
+            const slot =
+              formatSlotForChat(
+                proposedPlan!.start,
+                proposedPlan!.end
+              );
+
+            await insertMessage({
+              roomId:
+                room!.id,
+
+              sender:
+                "Cubbie",
+
+              kind:
+                "cubbie",
+
+              body:
+                `everyone's in 🎉\n\n${slot}\n\nplan confirmed.`,
+            });
+
+            await supabase
+              .from(
+                "coordination_requests"
+              )
+              .update({
+                status:
+                  "confirmed",
+              })
+              .eq(
+                "id",
+                proposedPlan!
+                  .requestId
+              );
+          }
+        }
+      } catch (error) {
+        console.error(
+          "Confirmation summary failed:",
+          error
+        );
+      }
+    }
+
+    refreshOwnConfirmation();
+    refreshSummary();
+
+    const channel =
+      supabase
+        .channel(
+          `confirmations-${proposedPlan.requestId}-${currentUserId}`
+        )
+        .on(
+          "postgres_changes",
+          {
+            event:
+              "*",
+
+            schema:
+              "public",
+
+            table:
+              "plan_confirmations",
+          },
+          () => {
+            refreshOwnConfirmation();
+            refreshSummary();
+          }
+        )
+        .subscribe();
+
+    return () => {
+      supabase.removeChannel(
+        channel
+      );
+    };
+  }, [
+    room,
+    proposedPlan,
+    currentUserId,
+    insertMessage,
+  ]);
+
+  /* ==========================================================
+     MEMBER DATA
+     ========================================================== */
+
+  const memberNames =
+    useMemo(() => {
+      return (
+        room?.members.map(
+          (member) =>
+            member.name
+        ) ?? []
+      );
+    }, [room]);
+
+  const joinedMembers =
+    useMemo(() => {
+      return (
+        room?.members.filter(
+          (member) =>
+            member.status ===
+            "joined" &&
+            member.userId
+        ) ?? []
+      );
+    }, [room]);
+
+  /* ==========================================================
+     SCROLL
      ========================================================== */
 
   useEffect(() => {
     bottomRef.current?.scrollIntoView({
       behavior: "smooth",
     });
-  }, [messages, cubbieTyping]);
+  }, [
+    messages,
+    cubbieTyping,
+    coordinationProgress,
+    confirmationProgress,
+    myConfirmation,
+  ]);
 
   /* ==========================================================
-     MEMBER NAMES
-     ========================================================== */
-
-  const memberNames =
-    useMemo(() => {
-      if (!room) {
-        return [];
-      }
-
-      return room.members.map(
-        (member) => member.name
-      );
-    }, [room]);
-
-  /* ==========================================================
-     INVITE LINK
+     INVITE
      ========================================================== */
 
   const inviteLink =
-    typeof window !== "undefined" &&
+    typeof window !==
+      "undefined" &&
     code
       ? `${window.location.origin}/join?code=${code}`
       : "";
@@ -453,158 +1412,67 @@ function RoomExperience() {
 
       setCopied(true);
 
-      window.setTimeout(() => {
-        setCopied(false);
-      }, 1800);
+      window.setTimeout(
+        () =>
+          setCopied(false),
+        1800
+      );
     } catch (error) {
-      console.error(
-        "Could not copy invite:",
-        error
-      );
+      console.error(error);
     }
   }
 
   /* ==========================================================
-     INSERT MESSAGE INTO SUPABASE
+     PRIVACY QUESTIONS
      ========================================================== */
 
-  async function insertMessage({
-    sender,
-    body,
-    kind,
-  }: {
-    sender: string;
-    body: string;
-    kind: MessageKind;
-  }) {
-    if (!room) {
-      return null;
-    }
-
-    const {
-      data,
-      error,
-    } = await supabase
-      .from("messages")
-      .insert({
-        room_id: room.id,
-        sender_name: sender,
-        sender_type: kind,
-        body,
-      })
-      .select()
-      .single();
-
-    if (error || !data) {
-      console.error(
-        "Message insert failed:",
-        error
-      );
-
-      return null;
-    }
-
-    const newMessage: Message = {
-      id: data.id,
-      sender: data.sender_name,
-      body: data.body,
-
-      kind:
-        data.sender_type as MessageKind,
-
-      mine:
-        data.sender_name ===
-        currentUser,
-
-      time:
-        formatTime(data.created_at),
-    };
-
-    setMessages((current) => {
-      /*
-       * Prevent accidental duplicate
-       * rendering when we later add
-       * Supabase Realtime.
-       */
-      if (
-        current.some(
-          (message) =>
-            message.id ===
-            newMessage.id
-        )
-      ) {
-        return current;
-      }
-
-      return [
-        ...current,
-        newMessage,
-      ];
-    });
-
-    return newMessage;
-  }
-
-  /* ==========================================================
-     PRIVACY BOUNDARY
-     ========================================================== */
-
-  function answerPrivacyQuestion(
+  function privacyAnswer(
     text: string
   ) {
-    const normalized =
+    const value =
       text.toLowerCase();
 
-    const identityQuestion =
-      normalized.includes(
+    if (
+      value.includes(
         "who can't"
       ) ||
-      normalized.includes(
+      value.includes(
         "who cant"
       ) ||
-      normalized.includes(
+      value.includes(
         "who cannot"
       ) ||
-      normalized.includes(
+      value.includes(
         "who is busy"
       ) ||
-      normalized.includes(
+      value.includes(
         "who rejected"
-      );
-
-    const reasonQuestion =
-      normalized.includes(
-        "why can't"
       ) ||
-      normalized.includes(
-        "why cant"
-      ) ||
-      normalized.includes(
-        "why doesn't"
-      ) ||
-      normalized.includes(
-        "why doesnt"
-      ) ||
-      normalized.includes(
-        "why not"
-      );
-
-    if (identityQuestion) {
+      value.includes(
+        "who declined"
+      )
+    ) {
       return (
-        "i keep individual availability " +
-        "private by default. i can work " +
-        "around it without identifying anyone."
+        "nice try 😭 i keep individual availability and responses private. i can coordinate around them without identifying anyone."
       );
     }
 
-    if (reasonQuestion) {
+    if (
+      value.includes(
+        "why can't"
+      ) ||
+      value.includes(
+        "why cant"
+      ) ||
+      value.includes(
+        "why not"
+      ) ||
+      value.includes(
+        "why did"
+      )
+    ) {
       return (
-        "that conflicts with private " +
-        "constraints in the group. " +
-        "i can find a better option, " +
-        "but i won't share anyone's " +
-        "schedule details unless they " +
-        "choose to."
+        "i can explain the group tradeoff, but i won't share anyone's private schedule, reason, or confirmation response."
       );
     }
 
@@ -612,89 +1480,274 @@ function RoomExperience() {
   }
 
   /* ==========================================================
-     TEMPORARY COORDINATION RESPONSE
+     START COORDINATION
      ========================================================== */
 
-  function buildCoordinationResponse() {
-    /*
-     * IMPORTANT:
-     *
-     * This response does NOT fabricate
-     * a recommended time.
-     *
-     * The actual TypeScript negotiation
-     * engine will replace this in the
-     * next milestone.
-     */
-
-    return (
-      "checking everyone's constraints " +
-      "privately — give me a sec. " +
-      "i'll only bring the group the " +
-      "options that work."
-    );
-  }
-
-  /* ==========================================================
-     CUBBIE RESPONSE
-     ========================================================== */
-
-  async function handleCubbieRequest(
+  async function startCoordination(
     text: string
   ) {
-    const privacyAnswer =
-      answerPrivacyQuestion(text);
+    if (!room) {
+      return;
+    }
 
-    setCubbieTyping(true);
-
-    await new Promise((resolve) =>
-      window.setTimeout(
-        resolve,
-        700
-      )
-    );
-
-    setCubbieTyping(false);
-
-    await insertMessage({
-      sender: "Cubbie",
-
-      body:
-        privacyAnswer ??
-        buildCoordinationResponse(),
-
-      kind: "cubbie",
-    });
-
-    if (!privacyAnswer) {
-      setCubbieTyping(true);
-
-      await new Promise((resolve) =>
-        window.setTimeout(
-          resolve,
-          900
-        )
-      );
-
-      setCubbieTyping(false);
-
+    if (
+      joinedMembers.length <
+      2
+    ) {
       await insertMessage({
-        sender: "Cubbie",
+        roomId:
+          room.id,
+
+        sender:
+          "Cubbie",
+
+        kind:
+          "cubbie",
 
         body:
-          "i'm ready to compare times. " +
-          "once everyone has private " +
-          "availability set up, i'll " +
-          "negotiate the best fit without " +
-          "posting anyone's reasons.",
-
-        kind: "cubbie",
+          "i need at least two joined people before i can coordinate a group plan.",
       });
+
+      return;
+    }
+
+    if (activeRequest) {
+      await insertMessage({
+        roomId:
+          room.id,
+
+        sender:
+          "Cubbie",
+
+        kind:
+          "cubbie",
+
+        body:
+          "i'm already checking a plan with everyone's agents 👀",
+      });
+
+      return;
+    }
+
+    try {
+      setCoordinationBusy(
+        true
+      );
+
+      setCubbieTyping(
+        true
+      );
+
+      await sleep(550);
+
+      setCubbieTyping(
+        false
+      );
+
+      await insertMessage({
+        roomId:
+          room.id,
+
+        sender:
+          "Cubbie",
+
+        kind:
+          "cubbie",
+
+        body:
+          "checking with everyone's Cubbie privately 👀\n\nprivate reasons stay with each person.",
+      });
+
+      const request =
+        await createCoordinationRequest({
+          roomId:
+            room.id,
+
+          text,
+
+          durationMinutes:
+            120,
+        });
+
+      setActiveRequest(
+        request
+      );
+
+      setProposedPlan(
+        null
+      );
+
+      setConfirmationStarted(
+        false
+      );
+
+      setMyConfirmation(
+        null
+      );
+
+      setConfirmationProgress(
+        ""
+      );
+
+      setCoordinationProgress(
+        `0/${joinedMembers.length} personal agents responded`
+      );
+    } catch (error) {
+      console.error(error);
+
+      await insertMessage({
+        roomId:
+          room.id,
+
+        sender:
+          "Cubbie",
+
+        kind:
+          "cubbie",
+
+        body:
+          "i couldn't start the private check. make sure everyone has joined and try again.",
+      });
+    } finally {
+      setCoordinationBusy(
+        false
+      );
     }
   }
 
   /* ==========================================================
-     SEND HUMAN MESSAGE
+     START PRIVATE CONFIRMATIONS
+     ========================================================== */
+
+  async function startConfirmations() {
+    if (
+      !room ||
+      !proposedPlan ||
+      confirmationBusy
+    ) {
+      return;
+    }
+
+    setConfirmationBusy(
+      true
+    );
+
+    try {
+      await createPrivateConfirmations({
+        requestId:
+          proposedPlan.requestId,
+
+        roomId:
+          room.id,
+
+        slotStart:
+          proposedPlan.start,
+
+        slotEnd:
+          proposedPlan.end,
+      });
+
+      setConfirmationStarted(
+        true
+      );
+
+      const pending =
+        await getMyPendingConfirmation({
+          requestId:
+            proposedPlan.requestId,
+        });
+
+      setMyConfirmation(
+        pending
+      );
+
+      setConfirmationProgress(
+        `0/${joinedMembers.length} confirmed`
+      );
+
+      await insertMessage({
+        roomId:
+          room.id,
+
+        sender:
+          "Cubbie",
+
+        kind:
+          "cubbie",
+
+        body:
+          "sent everyone a private confirmation 🔒\n\ni'll tell the group when we have consensus — not who said what.",
+      });
+    } catch (error) {
+      console.error(
+        "Could not start confirmations:",
+        error
+      );
+    } finally {
+      setConfirmationBusy(
+        false
+      );
+    }
+  }
+
+  /* ==========================================================
+     RESPOND INLINE
+     ========================================================== */
+
+  async function respondInline(
+    response:
+      | "confirmed"
+      | "declined"
+  ) {
+    if (
+      !myConfirmation ||
+      confirmationBusy
+    ) {
+      return;
+    }
+
+    setConfirmationBusy(
+      true
+    );
+
+    try {
+      await respondToConfirmation({
+        confirmationId:
+          myConfirmation.id,
+
+        response,
+      });
+
+      setMyConfirmation(
+        null
+      );
+
+      if (
+        response ===
+        "confirmed"
+      ) {
+        setConfirmationProgress(
+          "your response is in ✓"
+        );
+      } else {
+        setConfirmationProgress(
+          "your response is private ✓"
+        );
+      }
+    } catch (error) {
+      console.error(
+        "Confirmation failed:",
+        error
+      );
+    } finally {
+      setConfirmationBusy(
+        false
+      );
+    }
+  }
+
+  /* ==========================================================
+     SEND MESSAGE
      ========================================================== */
 
   async function sendMessage(
@@ -718,64 +1771,65 @@ function RoomExperience() {
 
     const inserted =
       await insertMessage({
+        roomId:
+          room.id,
+
         sender:
-          currentUser || "You",
+          currentUser ||
+          "You",
 
         body,
 
-        kind: "human",
+        kind:
+          "human",
       });
 
     setSending(false);
 
     if (!inserted) {
-      /*
-       * Restore message if insert failed.
-       */
       setComposer(body);
       return;
     }
 
-    const normalized =
-      body.toLowerCase();
+    const answer =
+      privacyAnswer(body);
 
-    const shouldAskCubbie =
-      normalized.includes(
-        "@cubbie"
-      ) ||
-      normalized.includes(
-        "who can't"
-      ) ||
-      normalized.includes(
-        "who cant"
-      ) ||
-      normalized.includes(
-        "who cannot"
-      ) ||
-      normalized.includes(
-        "who is busy"
-      ) ||
-      normalized.includes(
-        "who rejected"
-      ) ||
-      normalized.includes(
-        "why can't"
-      ) ||
-      normalized.includes(
-        "why cant"
-      ) ||
-      normalized.includes(
-        "why doesn't"
-      ) ||
-      normalized.includes(
-        "why doesnt"
-      ) ||
-      normalized.includes(
-        "why not"
+    if (answer) {
+      setCubbieTyping(
+        true
       );
 
-    if (shouldAskCubbie) {
-      await handleCubbieRequest(
+      await sleep(500);
+
+      setCubbieTyping(
+        false
+      );
+
+      await insertMessage({
+        roomId:
+          room.id,
+
+        sender:
+          "Cubbie",
+
+        kind:
+          "cubbie",
+
+        body:
+          answer,
+      });
+
+      return;
+    }
+
+    if (
+      body
+        .toLowerCase()
+        .includes(
+          "@cubbie"
+        )
+    ) {
+      await startCoordination(
         body
       );
     }
@@ -789,9 +1843,14 @@ function RoomExperience() {
     return <RoomLoading />;
   }
 
-  if (!code || !room) {
+  if (
+    !room ||
+    !code
+  ) {
     return (
-      <RoomNotFound code={code} />
+      <RoomNotFound
+        code={code}
+      />
     );
   }
 
@@ -801,21 +1860,23 @@ function RoomExperience() {
 
   return (
     <main className="min-h-screen bg-[#eef0f5] text-slate-950">
+
       <div className="mx-auto flex min-h-screen max-w-7xl items-stretch justify-center md:px-6 md:py-6">
+
         <div className="grid w-full overflow-hidden bg-white shadow-2xl shadow-slate-300/50 md:min-h-[calc(100vh-48px)] md:max-w-6xl md:grid-cols-[280px_1fr] md:rounded-[30px]">
 
-          {/* =================================================
-              DESKTOP SIDEBAR
-              ================================================= */}
+          {/* SIDEBAR */}
 
           <aside className="hidden border-r border-slate-200 bg-[#fafafa] md:flex md:flex-col">
 
             <div className="border-b border-slate-200 p-5">
+
               <Link
                 href="/"
                 className="flex items-center gap-3"
               >
-                <div className="flex h-10 w-10 items-center justify-center rounded-2xl bg-violet-600 text-white shadow-md shadow-violet-200">
+
+                <div className="flex h-10 w-10 items-center justify-center rounded-2xl bg-violet-600 text-white">
                   <MessageCircle
                     size={20}
                   />
@@ -830,10 +1891,13 @@ function RoomExperience() {
                     powered by Cubbie
                   </div>
                 </div>
+
               </Link>
+
             </div>
 
             <div className="p-4">
+
               <div className="mb-2 px-2 text-xs font-semibold uppercase tracking-wider text-slate-400">
                 This group
               </div>
@@ -845,19 +1909,25 @@ function RoomExperience() {
                 </div>
 
                 <div className="mt-1 text-xs text-slate-400">
-                  {room.members.length + 1}{" "}
-                  participants
+                  {room.members.length + 1} participants
                 </div>
 
                 <div className="mt-4 flex flex-wrap gap-1.5">
 
-                  {memberNames.map(
-                    (name) => (
+                  {room.members.map(
+                    (member) => (
                       <span
-                        key={name}
-                        className="rounded-full bg-slate-100 px-2.5 py-1 text-xs text-slate-600"
+                        key={
+                          member.id
+                        }
+                        className={`rounded-full px-2.5 py-1 text-xs ${
+                          member.status ===
+                          "joined"
+                            ? "bg-slate-100 text-slate-600"
+                            : "bg-amber-50 text-amber-600"
+                        }`}
                       >
-                        {name}
+                        {member.name}
                       </span>
                     )
                   )}
@@ -867,10 +1937,13 @@ function RoomExperience() {
                   </span>
 
                 </div>
+
               </div>
+
             </div>
 
             <div className="mt-auto p-4">
+
               <div className="rounded-2xl border border-violet-100 bg-violet-50 p-4">
 
                 <div className="flex items-center gap-2 text-sm font-semibold text-violet-900">
@@ -881,37 +1954,43 @@ function RoomExperience() {
                 </div>
 
                 <p className="mt-2 text-xs leading-5 text-violet-700/70">
-                  The group sees
-                  coordination results,
-                  not private reasons or
-                  schedule details.
+                  Raw constraints and individual
+                  confirmation responses stay
+                  private.
                 </p>
 
+                <Link
+                  href={`/private?code=${code}`}
+                  className="mt-4 flex w-full items-center justify-center gap-2 rounded-xl bg-violet-600 px-3 py-2.5 text-xs font-semibold text-white"
+                >
+                  <LockKeyhole
+                    size={14}
+                  />
+                  My private setup
+                </Link>
+
               </div>
+
             </div>
 
           </aside>
 
-          {/* =================================================
-              CHAT
-              ================================================= */}
+          {/* CHAT */}
 
           <section className="flex min-h-screen min-w-0 flex-col bg-[#f4f5f8] md:min-h-0">
-
-            {/* HEADER */}
 
             <header className="sticky top-0 z-20 flex items-center gap-3 border-b border-slate-200 bg-white/95 px-4 py-3 backdrop-blur md:px-5">
 
               <Link
                 href="/"
-                className="flex h-9 w-9 items-center justify-center rounded-full text-slate-500 transition hover:bg-slate-100 md:hidden"
+                className="flex h-9 w-9 items-center justify-center rounded-full text-slate-500 md:hidden"
               >
                 <ArrowLeft
                   size={20}
                 />
               </Link>
 
-              <div className="flex h-11 w-11 shrink-0 items-center justify-center rounded-full bg-gradient-to-br from-orange-100 to-rose-100 text-xl">
+              <div className="flex h-11 w-11 items-center justify-center rounded-full bg-gradient-to-br from-orange-100 to-rose-100 text-xl">
                 💬
               </div>
 
@@ -932,13 +2011,19 @@ function RoomExperience() {
 
               <button
                 type="button"
-                onClick={copyInvite}
-                className="hidden items-center gap-2 rounded-xl border border-slate-200 bg-white px-3 py-2 text-xs font-medium text-slate-600 shadow-sm transition hover:bg-slate-50 sm:flex"
+                onClick={
+                  copyInvite
+                }
+                className="hidden items-center gap-2 rounded-xl border border-slate-200 px-3 py-2 text-xs sm:flex"
               >
                 {copied ? (
-                  <Check size={15} />
+                  <Check
+                    size={15}
+                  />
                 ) : (
-                  <Copy size={15} />
+                  <Copy
+                    size={15}
+                  />
                 )}
 
                 {copied
@@ -946,43 +2031,37 @@ function RoomExperience() {
                   : "Invite"}
               </button>
 
-              <button
-                type="button"
-                className="flex h-9 w-9 items-center justify-center rounded-full text-slate-400 transition hover:bg-slate-100"
-                aria-label="More options"
-              >
-                <MoreVertical
-                  size={20}
-                />
-              </button>
+              <MoreVertical
+                size={20}
+                className="text-slate-400"
+              />
 
             </header>
 
-            {/* ROOM CODE */}
+            {/* ROOM BAR */}
 
             <div className="border-b border-slate-200 bg-white px-4 py-2.5">
 
-              <div className="mx-auto flex max-w-3xl items-center justify-center gap-2 text-xs text-slate-400">
+              <div className="mx-auto flex max-w-3xl flex-wrap items-center justify-center gap-2 text-xs text-slate-400">
 
-                <Users size={13} />
+                <Users
+                  size={13}
+                />
 
-                Room code
+                Room
 
-                <span className="font-mono font-semibold tracking-wider text-slate-700">
+                <span className="font-mono font-semibold text-slate-700">
                   {code}
                 </span>
 
                 <span>·</span>
 
-                <button
-                  type="button"
-                  onClick={copyInvite}
-                  className="font-medium text-violet-600 hover:text-violet-700"
+                <Link
+                  href={`/private?code=${code}`}
+                  className="font-medium text-violet-600"
                 >
-                  {copied
-                    ? "Invite copied"
-                    : "Copy invite"}
-                </button>
+                  Private setup
+                </Link>
 
               </div>
 
@@ -995,18 +2074,20 @@ function RoomExperience() {
               <div className="mx-auto max-w-3xl space-y-4">
 
                 <div className="flex justify-center">
-
-                  <div className="rounded-full bg-white px-3 py-1.5 text-[11px] text-slate-400 shadow-sm ring-1 ring-slate-200">
+                  <div className="rounded-full bg-white px-3 py-1.5 text-[11px] text-slate-400 shadow-sm">
                     Today
                   </div>
-
                 </div>
 
                 {messages.map(
                   (message) => (
                     <ChatBubble
-                      key={message.id}
-                      message={message}
+                      key={
+                        message.id
+                      }
+                      message={
+                        message
+                      }
                     />
                   )
                 )}
@@ -1015,13 +2096,97 @@ function RoomExperience() {
                   <CubbieTyping />
                 )}
 
-                <div ref={bottomRef} />
+                {coordinationProgress &&
+                  activeRequest && (
+                    <StatusPill
+                      text={
+                        coordinationProgress
+                      }
+                    />
+                  )}
+
+                {/* PROPOSED PLAN */}
+
+                {proposedPlan &&
+                  !confirmationStarted && (
+                    <div className="flex justify-start">
+
+                      <div className="max-w-[88%] rounded-2xl border border-violet-100 bg-white p-4 shadow-sm">
+
+                        <div className="text-xs font-semibold uppercase tracking-wider text-violet-500">
+                          Proposed plan
+                        </div>
+
+                        <div className="mt-2 font-semibold text-slate-900">
+                          {formatSlotForChat(
+                            proposedPlan.start,
+                            proposedPlan.end
+                          )}
+                        </div>
+
+                        <button
+                          type="button"
+                          onClick={
+                            startConfirmations
+                          }
+                          disabled={
+                            confirmationBusy
+                          }
+                          className="mt-4 w-full rounded-xl bg-violet-600 px-4 py-2.5 text-sm font-semibold text-white disabled:opacity-40"
+                        >
+                          Check privately with everyone
+                        </button>
+
+                      </div>
+
+                    </div>
+                  )}
+
+                {/* PRIVATE CONFIRMATION */}
+
+                {myConfirmation && (
+                  <PrivateConfirmationCard
+                    slotStart={
+                      proposedPlan?.start ??
+                      ""
+                    }
+                    slotEnd={
+                      proposedPlan?.end ??
+                      ""
+                    }
+                    busy={
+                      confirmationBusy
+                    }
+                    onConfirm={() =>
+                      respondInline(
+                        "confirmed"
+                      )
+                    }
+                    onDecline={() =>
+                      respondInline(
+                        "declined"
+                      )
+                    }
+                  />
+                )}
+
+                {confirmationProgress && (
+                  <StatusPill
+                    text={
+                      confirmationProgress
+                    }
+                  />
+                )}
+
+                <div
+                  ref={bottomRef}
+                />
 
               </div>
 
             </div>
 
-            {/* PRIVACY HINT */}
+            {/* PRIVACY */}
 
             <div className="border-t border-slate-200 bg-white/70 px-4 py-2">
 
@@ -1031,10 +2196,8 @@ function RoomExperience() {
                   size={12}
                 />
 
-                Cubbie won&apos;t reveal
-                why someone is unavailable
-                unless they choose to
-                share it.
+                Private reasons and individual
+                responses stay out of the group chat.
 
               </div>
 
@@ -1043,32 +2206,40 @@ function RoomExperience() {
             {/* COMPOSER */}
 
             <form
-              onSubmit={sendMessage}
+              onSubmit={
+                sendMessage
+              }
               className="border-t border-slate-200 bg-white p-3 md:p-4"
             >
 
               <div className="mx-auto flex max-w-3xl items-end gap-2">
 
-                <button
-                  type="button"
-                  className="flex h-11 w-11 shrink-0 items-center justify-center rounded-full bg-slate-100 text-xl text-slate-500 transition hover:bg-slate-200"
+                <Link
+                  href={`/private?code=${code}`}
+                  className="flex h-11 w-11 items-center justify-center rounded-full bg-slate-100 text-slate-500"
                 >
-                  +
-                </button>
+                  <LockKeyhole
+                    size={18}
+                  />
+                </Link>
 
                 <div className="flex min-h-11 flex-1 items-center rounded-[22px] bg-slate-100 px-4">
 
                   <input
-                    value={composer}
-                    onChange={(event) =>
+                    value={
+                      composer
+                    }
+                    onChange={(
+                      event
+                    ) =>
                       setComposer(
-                        event.target.value
+                        event
+                          .target
+                          .value
                       )
                     }
-                    placeholder={
-                      `Message ${room.name}...`
-                    }
-                    className="w-full bg-transparent py-3 text-sm outline-none placeholder:text-slate-400"
+                    placeholder={`Message ${room.name}...`}
+                    className="w-full bg-transparent py-3 text-sm outline-none"
                   />
 
                 </div>
@@ -1077,24 +2248,23 @@ function RoomExperience() {
                   type="submit"
                   disabled={
                     !composer.trim() ||
-                    sending
+                    sending ||
+                    coordinationBusy
                   }
-                  className="flex h-11 w-11 shrink-0 items-center justify-center rounded-full bg-violet-600 text-white shadow-md shadow-violet-200 transition hover:bg-violet-700 disabled:cursor-not-allowed disabled:bg-slate-200 disabled:text-slate-400 disabled:shadow-none"
+                  className="flex h-11 w-11 items-center justify-center rounded-full bg-violet-600 text-white disabled:bg-slate-200"
                 >
-                  <Send size={18} />
+                  <Send
+                    size={18}
+                  />
                 </button>
 
               </div>
 
               <div className="mx-auto mt-2 max-w-3xl px-14 text-[11px] text-slate-400">
-
                 Try:{" "}
-
                 <span className="font-medium text-violet-600">
-                  @Cubbie find a time
-                  for us this weekend
+                  @Cubbie find a time for us this weekend
                 </span>
-
               </div>
 
             </form>
@@ -1102,8 +2272,120 @@ function RoomExperience() {
           </section>
 
         </div>
+
       </div>
+
     </main>
+  );
+}
+
+/* ============================================================
+   PRIVATE CONFIRMATION CARD
+   ============================================================ */
+
+function PrivateConfirmationCard({
+  slotStart,
+  slotEnd,
+  busy,
+  onConfirm,
+  onDecline,
+}: {
+  slotStart: string;
+  slotEnd: string;
+  busy: boolean;
+  onConfirm: () => void;
+  onDecline: () => void;
+}) {
+  return (
+    <div className="flex justify-end">
+
+      <div className="w-full max-w-md rounded-2xl border border-violet-200 bg-violet-50 p-4 shadow-sm">
+
+        <div className="flex items-center gap-2 text-xs font-semibold text-violet-700">
+
+          <LockKeyhole
+            size={14}
+          />
+
+          PRIVATE · YOU ↔ CUBBIE
+
+        </div>
+
+        <div className="mt-3 text-sm text-slate-600">
+          The group is considering:
+        </div>
+
+        <div className="mt-1 font-semibold text-slate-950">
+          {slotStart &&
+          slotEnd
+            ? formatSlotForChat(
+                slotStart,
+                slotEnd
+              )
+            : "Proposed plan"}
+        </div>
+
+        <p className="mt-3 text-xs leading-5 text-slate-500">
+          Your response stays private.
+          The group sees only whether
+          consensus was reached.
+        </p>
+
+        <div className="mt-4 grid grid-cols-2 gap-2">
+
+          <button
+            type="button"
+            disabled={busy}
+            onClick={
+              onConfirm
+            }
+            className="rounded-xl bg-violet-600 px-3 py-2.5 text-sm font-semibold text-white disabled:opacity-40"
+          >
+            I&apos;m in 👍
+          </button>
+
+          <button
+            type="button"
+            disabled={busy}
+            onClick={
+              onDecline
+            }
+            className="rounded-xl border border-slate-200 bg-white px-3 py-2.5 text-sm font-semibold text-slate-600 disabled:opacity-40"
+          >
+            Can&apos;t make it
+          </button>
+
+        </div>
+
+      </div>
+
+    </div>
+  );
+}
+
+/* ============================================================
+   STATUS
+   ============================================================ */
+
+function StatusPill({
+  text,
+}: {
+  text: string;
+}) {
+  return (
+    <div className="flex justify-center">
+
+      <div className="flex items-center gap-2 rounded-full border border-violet-100 bg-violet-50 px-3 py-1.5 text-[11px] font-medium text-violet-700">
+
+        <Sparkles
+          size={12}
+        />
+
+        {text}
+
+      </div>
+
+    </div>
   );
 }
 
@@ -1116,11 +2398,14 @@ function ChatBubble({
 }: {
   message: Message;
 }) {
-  if (message.kind === "system") {
+  if (
+    message.kind ===
+    "system"
+  ) {
     return (
       <div className="flex justify-center">
 
-        <div className="rounded-full bg-white px-3 py-1.5 text-xs text-slate-400 shadow-sm ring-1 ring-slate-200">
+        <div className="rounded-full bg-white px-3 py-1.5 text-xs text-slate-400 shadow-sm">
           {message.body}
         </div>
 
@@ -1128,10 +2413,10 @@ function ChatBubble({
     );
   }
 
-  const isCubbie =
-    message.kind === "cubbie";
-
-  if (isCubbie) {
+  if (
+    message.kind ===
+    "cubbie"
+  ) {
     return (
       <div className="max-w-[88%] md:max-w-[72%]">
 
@@ -1149,7 +2434,7 @@ function ChatBubble({
 
         </div>
 
-        <div className="rounded-2xl rounded-tl-md bg-violet-600 px-4 py-3 text-sm leading-6 text-white shadow-md shadow-violet-100">
+        <div className="whitespace-pre-line rounded-2xl rounded-tl-md bg-violet-600 px-4 py-3 text-sm leading-6 text-white shadow-md shadow-violet-100">
           {message.body}
         </div>
 
@@ -1169,13 +2454,12 @@ function ChatBubble({
       <div className="max-w-[82%] md:max-w-[68%]">
 
         <div
-          className={`mb-1 flex items-center gap-2 px-1 text-[11px] ${
+          className={`mb-1 flex gap-2 px-1 text-[11px] ${
             message.mine
               ? "justify-end text-slate-400"
               : "text-slate-500"
           }`}
         >
-
           <span className="font-medium">
             {message.sender}
           </span>
@@ -1183,11 +2467,10 @@ function ChatBubble({
           <span>
             {message.time}
           </span>
-
         </div>
 
         <div
-          className={`rounded-2xl px-4 py-2.5 text-sm leading-6 shadow-sm ${
+          className={`whitespace-pre-line rounded-2xl px-4 py-2.5 text-sm leading-6 shadow-sm ${
             message.mine
               ? "rounded-tr-md bg-[#d9fdd3]"
               : "rounded-tl-md bg-white"
@@ -1203,30 +2486,22 @@ function ChatBubble({
 }
 
 /* ============================================================
-   CUBBIE TYPING
+   TYPING
    ============================================================ */
 
 function CubbieTyping() {
   return (
-    <div className="max-w-[70%]">
+    <div>
 
-      <div className="mb-1 flex items-center gap-1.5 px-1 text-[11px] font-medium text-violet-600">
-
-        <div className="flex h-4 w-4 items-center justify-center rounded-full bg-violet-600 text-[8px] text-white">
-          C
-        </div>
-
+      <div className="mb-1 text-[11px] font-medium text-violet-600">
         Cubbie
-
       </div>
 
-      <div className="inline-flex items-center gap-1.5 rounded-2xl rounded-tl-md bg-violet-600 px-4 py-3 shadow-md shadow-violet-100">
-
-        <span className="h-1.5 w-1.5 animate-bounce rounded-full bg-violet-200 [animation-delay:-0.3s]" />
-
-        <span className="h-1.5 w-1.5 animate-bounce rounded-full bg-violet-200 [animation-delay:-0.15s]" />
+      <div className="inline-flex gap-1.5 rounded-2xl bg-violet-600 px-4 py-3">
 
         <span className="h-1.5 w-1.5 animate-bounce rounded-full bg-violet-200" />
+        <span className="h-1.5 w-1.5 animate-bounce rounded-full bg-violet-200 [animation-delay:-0.15s]" />
+        <span className="h-1.5 w-1.5 animate-bounce rounded-full bg-violet-200 [animation-delay:-0.3s]" />
 
       </div>
 
@@ -1235,7 +2510,7 @@ function CubbieTyping() {
 }
 
 /* ============================================================
-   LOADING
+   LOADING / NOT FOUND
    ============================================================ */
 
 function RoomLoading() {
@@ -1244,11 +2519,11 @@ function RoomLoading() {
 
       <div className="text-center">
 
-        <div className="mx-auto flex h-12 w-12 items-center justify-center rounded-2xl bg-violet-600 text-white shadow-lg shadow-violet-200">
-          <Sparkles size={22} />
-        </div>
+        <Sparkles
+          className="mx-auto text-violet-600"
+        />
 
-        <div className="mt-4 font-medium text-slate-700">
+        <div className="mt-3 text-sm font-medium text-slate-600">
           Opening your group...
         </div>
 
@@ -1258,10 +2533,6 @@ function RoomLoading() {
   );
 }
 
-/* ============================================================
-   NOT FOUND
-   ============================================================ */
-
 function RoomNotFound({
   code,
 }: {
@@ -1270,35 +2541,25 @@ function RoomNotFound({
   return (
     <main className="flex min-h-screen items-center justify-center bg-[#f6f7fb] px-5">
 
-      <div className="w-full max-w-md rounded-[28px] border border-slate-200 bg-white p-8 text-center shadow-xl shadow-slate-200/70">
+      <div className="max-w-md rounded-3xl bg-white p-8 text-center shadow-xl">
 
-        <div className="mx-auto flex h-12 w-12 items-center justify-center rounded-2xl bg-slate-100 text-slate-500">
-          <MessageCircle
-            size={22}
-          />
-        </div>
+        <MessageCircle
+          className="mx-auto text-slate-400"
+        />
 
-        <h1 className="mt-5 text-2xl font-semibold">
+        <h1 className="mt-4 text-2xl font-semibold">
           Group not found
         </h1>
 
-        <p className="mt-2 leading-7 text-slate-500">
-
+        <p className="mt-2 text-slate-500">
           {code
-            ? `I couldn't find room ${code}. Check the invite code and try again.`
+            ? `I couldn't find room ${code}.`
             : "This invite is missing a room code."}
-
-        </p>
-
-        <p className="mt-3 text-sm leading-6 text-slate-400">
-          This room may have been
-          removed, or the invite code
-          may be incorrect.
         </p>
 
         <Link
           href="/create"
-          className="mt-6 inline-flex rounded-2xl bg-violet-600 px-5 py-3 font-medium text-white"
+          className="mt-6 inline-flex rounded-xl bg-violet-600 px-5 py-3 text-white"
         >
           Create a group
         </Link>
