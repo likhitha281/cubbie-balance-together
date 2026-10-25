@@ -148,3 +148,25 @@ else:
         "No agreement reached within "
         "the negotiation limit."
     )
+
+from src.fairness import (
+    FairnessStrategy,
+    choose_fair_slot,
+)
+
+
+print("\n--- Fairness Strategy Comparison ---")
+
+for strategy in FairnessStrategy:
+
+    result = choose_fair_slot(
+        proposals,
+        strategy,
+    )
+
+    print(f"\nStrategy: {strategy.value}")
+    print(f"Selected: {result.slot}")
+    print(f"Strategy score: {result.score}")
+    print(f"Total utility: {result.total_utility}")
+    print(f"Minimum utility: {result.minimum_utility}")
+    print(f"Utility gap: {result.utility_gap}")
